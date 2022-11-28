@@ -1,0 +1,1186 @@
+library(english)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(tm)
+library(glmnet)
+library(caret)
+library(patchwork)
+library(corpus)
+library(tau)
+# library(xlsx)
+library(openxlsx)
+library(SnowballC)
+library(tidytext)
+# library(tidytextextensions)
+
+get_ivan_tf_idf <- function(sample_text) {
+  print("Set up test data")
+  
+  # sample_text <- c("jupiter largest planet", "mars fourth planet sun")
+  
+  data_df <- tibble("uniq_id" = 1:length(sample_text),
+                    "text" = sample_text)
+  
+  # terms_df <- pmap_dfr(data_df,
+  #                      function(uniq_id_, text_) {
+  #                        
+  #                        terms <- text_ %>% 
+  #                          str_split(pattern = " ") %>% 
+  #                          unlist()
+  #                        
+  #                        return(tibble("uniq_id" = uniq_id_,
+  #                                      "text" = text_,
+  #                                      "terms" = terms))
+  #                      }) %>% 
+  #   group_by(uniq_id, text, terms) %>% 
+  #   mutate(counts = n()) %>% 
+  #   ungroup() %>% 
+  #   group_by(uniq_id) %>% 
+  #   mutate(total_in_text = max(row_number())) %>% 
+  #   ungroup() %>% 
+  #   distinct(uniq_id, text, terms, .keep_all = TRUE) %>% 
+  #   pivot_wider(id_cols = c("uniq_id", "text", "total_in_text"), 
+  #               names_from = terms, 
+  #               values_from = counts, 
+  #               values_fill = 0) %>% 
+  #   adorn_totals("row") %>% 
+  #   as_tibble()
+  # 
+  # terms_df$total_in_text[nrow(terms_df)] <- NA
+  # terms_df$text[nrow(terms_df)] <- NA
+  
+  print("Get term frequency")
+  term_frequency_df <- pmap_dfr(data_df,
+                                function(uniq_id_, text_) {
+                                  
+                                  terms <- text_ %>% 
+                                    str_split(pattern = " ") %>% 
+                                    unlist()
+                                  
+                                  return(tibble("uniq_id" = paste0("text_", uniq_id_),
+                                                # "text" = text_,
+                                                "terms" = terms))
+                                }) %>% 
+    group_by(uniq_id, terms) %>% 
+    mutate(counts = n()) %>% 
+    ungroup() %>% 
+    group_by(uniq_id) %>% 
+    mutate(total_terms = max(row_number())) %>% 
+    ungroup() %>% 
+    distinct(uniq_id, terms, .keep_all = TRUE) %>% 
+    mutate(term_frequency = counts/total_terms) %>% 
+    pivot_wider(id_cols = terms,
+                names_from = uniq_id,
+                values_from = c(counts, term_frequency),
+                values_fill = 0) %>% 
+    select(terms,
+           starts_with("term_frequency_"))
+  
+  print("Get idf frequency")
+  binary_count <- pmap_dfr(data_df,
+                           function(uniq_id_, text_) {
+                             
+                             terms <- text_ %>% 
+                               str_split(pattern = " ") %>% 
+                               unlist()
+                             
+                             return(tibble("uniq_id" = paste0("text_", uniq_id_),
+                                           # "text" = text_,
+                                           "terms" = terms))
+                           }) %>% 
+    group_by(uniq_id, terms) %>% 
+    mutate(counts = 1) %>% 
+    ungroup() %>% 
+    distinct(uniq_id, terms, .keep_all = TRUE) %>% 
+    pivot_wider(id_cols = terms,
+                names_from = uniq_id,
+                values_from = counts,
+                values_fill = 0)
+  
+  df_df <- binary_count %>% 
+    mutate(df = log2(nrow(data_df)/rowSums(binary_count[-1]))) %>% 
+    select(terms,
+           df)
+  
+  print("Get tf-idf")
+  tf_idf_scores <- term_frequency_df %>% 
+    select(starts_with("term_frequency_")) / (1/df_df$df)
+  
+  tf_idf_with_terms <- tf_idf_scores %>% 
+    as_tibble() %>% 
+    mutate(terms = df_df$terms) %>% 
+    select(terms, 
+           everything())
+  
+  return(tf_idf_with_terms)
+}
+
+sparsity_tune <- function(seed, sparsity_vars, abstracted_data, path_reports, 
+                          split_unprocessed_dfs, ngrams, cast_col, run_final_model, 
+                          training_prop, n_folds, lambda, fp_cost, fn_cost) {
+  
+  sparsity_results <- map_dfr(sparsity_vars,
+                              function(sparsity_) {
+                                set.seed(seed)
+                                
+                                if(!exists("total_iteration_sparsity")){
+                                  total_iteration_sparsity = length(sparsity_vars)
+                                }
+                                
+                                print(glue::glue("\nsparsity_tune: Iteration {which(sparsity_vars == sparsity_)} out of {total_iteration_sparsity}"))
+                                
+                                dtm_df <- make_dtm(split_unprocessed_dfs, ngrams, cast_col, sparsity = sparsity_, run_final_model = F)
+                                split_dfs <- make_full_dataset(dtm_df, abstracted_data, run_final_model = F)
+                                
+                                predictor_vars <- setdiff(names(dtm_df$training_text_mat_final), names(abstracted_data)) %>% 
+                                  setdiff(names(abstracted_data)) %>% 
+                                  c("outcome", "fold")
+                                
+                                train_df <- split_dfs$train %>% 
+                                  make_k_folds(folds = n_folds) %>% 
+                                  arrange(fold)
+                                
+                                train_model_df <- make_model_df(train_df, predictor_vars)
+                                
+                                unique_folds <- sort(unique(train_model_df$fold))
+                                
+                                all_cv_results <- map(unique_folds,
+                                                      do_modeling_within_fold,
+                                                      train_model_df = train_model_df,
+                                                      lambda = lambda) %>%
+                                  setNames(unique_folds)
+                                
+                                all_cv_predictions <- all_cv_results %>%
+                                  purrr::transpose() %>%
+                                  pluck("model_output") %>%
+                                  bind_rows() %>%
+                                  bind_cols(train_df %>%
+                                              select(uniq_id)) %>%
+                                  select(uniq_id, everything()) %>%
+                                  arrange(desc(predicted))
+                                auc <- pROC::auc(all_cv_predictions$true * 1,
+                                                 all_cv_predictions$predicted) %>%
+                                  as.numeric()
+                                
+                                return(tibble(sparsity = sparsity_, auc = auc))
+                              })
+  
+  sparsity_results_final <- sparsity_results %>%
+    mutate(iteration = row_number()) %>%
+    arrange(desc(auc), iteration)
+  
+  return(sparsity_results_final)
+  
+}
+
+lambda_tune <- function(seed, lambda_vars, unique_folds, train_model_df, 
+                        train_df, fp_cost, fn_cost, undetermined_cost) {
+  
+  lambda_results <- map_dfr(lambda_vars,
+                            function(lambda_) {
+                              set.seed(seed)
+                              
+                              if(!exists("total_iteration_lambda")){
+                                total_iteration_lambda = length(lambda_vars)
+                              }
+                              
+                              print(glue::glue("\nlambda_tune: Iteration {which(lambda_vars == lambda_)} out of {total_iteration_lambda}"))
+                              
+                              all_cv_results <- map(unique_folds,
+                                                    do_modeling_within_fold,
+                                                    train_model_df = train_model_df,
+                                                    lambda = lambda_) %>%
+                                setNames(unique_folds)
+                              
+                              all_cv_predictions <- all_cv_results %>%
+                                purrr::transpose() %>%
+                                pluck("model_output") %>%
+                                bind_rows() %>%
+                                bind_cols(train_df %>%
+                                            select(uniq_id)) %>%
+                                select(uniq_id, everything()) %>%
+                                arrange(desc(predicted))
+                              
+                              double_thresholds <- expand.grid(threshold1 = seq(0.01, .3, 0.01),
+                                                               threshold2 = seq(0.7, 0.99, 0.01))
+                              
+                              double_threshold_results <- test_double_thresholds(all_cv_predictions,
+                                                                                 double_thresholds$threshold1,
+                                                                                 double_thresholds$threshold2) %>% 
+                                mutate(cost = n_fn * fn_cost + n_fp * fp_cost + undetermined_rate * (n / (1-undetermined_rate)) * undetermined_cost)
+                              
+                              min_cost_threshold_double <- double_threshold_results %>% 
+                                filter(cost == min(cost)) %>% 
+                                pull(cost) %>% 
+                                unique()
+                              
+                              return(tibble(lambda = lambda_, cost = min_cost_threshold_double))
+                            })
+  
+  lambda_results_final <- lambda_results %>% 
+    mutate(iteration = row_number()) %>% 
+    arrange(cost, iteration)
+  
+  return(lambda_results_final)
+}
+
+make_dtm <- function(split_unprocessed_dfs, ngrams = 1, cast_col = "count", sparsity, run_final_model) {
+  #' Makes a document term matrix from a data.frame of text
+  #' @param text_df data.frame with texts, must contain columns "word"
+  #' and "text" and "count" or "tf_idf"
+  #' @param ngrams numeric specifying the number of grams, ex. ngrams = 2
+  #' corresponds to bigrams
+  #' @param cast_col character, must be either "count" (for bag of words) 
+  #' or "tf_idf" for TF-IDF
+  #' @return a document term matrix object (tm package)
+  
+  # #testing ivan tf-idf
+  # sample_text_ivan <- c("jupiter largest planet", "mars fourth planet sun earth earth earth", "earth earth")
+  # ivan_tf_idf <- get_ivan_tf_idf(sample_text_ivan) %>%
+  #   print()
+  # texts <- sample_text_ivan
+  # ngrams = 1
+  # corpus <- VCorpus(VectorSource(texts))
+  
+  # #testing tf-idf
+  # sample_text_tm <- c("jupiter largest planet", "mars fourth planet sun")
+  # # sample_text <- c("jupiter the largest planet", "mars the fourth planet from the sun")
+  # corpus_test <- VCorpus(VectorSource(sample_text)) #Make a corpus object from a text vector
+  # corpus_test <- tm_map(corpus_test, stripWhitespace)
+  # corpus_test <- tm_map(corpus_test, content_transformer(tolower))
+  # corpus_test <- tm_map(corpus_test, removeWords, stopwords("english"))
+  # dtm <- TermDocumentMatrix(corpus_test, control = list(weighting = weightTfIdf))
+  # tm_tf_idf <- as.matrix(dtm) %>%
+  #   print()
+  # 
+  # sample_text_tm <- c("jupiter largest planet", "mars fourth planet sun")
+  # texts <- sample_text_tm
+  # corpus <- VCorpus(VectorSource(texts))
+  # corpus <- tm_map(corpus, stripWhitespace)
+  # corpus <- tm_map(corpus, content_transformer(tolower))
+  # corpus <- tm_map(corpus, removeWords, stopwords("english"))
+  # corpus <- Corpus(VectorSource(texts))
+  # #end of test
+  
+  # new method
+  texts <- split_unprocessed_dfs$train$text #%>%
+  #   head(100)
+  # old method
+  # texts <- text_df$text
+  corpus <- VCorpus(VectorSource(texts))
+  # corpus <- tm_map(corpus, stripWhitespace)
+  # corpus <- tm_map(corpus, content_transformer(tolower))
+  # corpus <- tm_map(corpus, removeWords, stopwords("english"))
+  
+  print("Creating Training Set Features")
+  if ((cast_col == "count" | cast_col == "bi")) {
+    training_dtm <- DocumentTermMatrix(corpus, control = list(tokenize = function(x) tokenize_ngrams(x, ngrams = ngrams, cast_col)))
+  } else {
+    training_dtm <- DocumentTermMatrix(corpus, control = list(tokenize = function(x) tokenize_ngrams(x, ngrams = ngrams, cast_col), 
+                                                              weighting = function(x) weightTfIdf(x, normalize = TRUE)))
+  }
+  
+  # remove sparse terms from DTM
+  training_dtm_nonsparse <- removeSparseTerms(training_dtm, sparsity)
+  
+  # create matrix
+  training_matrix <- as.matrix(training_dtm_nonsparse) %>%
+    as_tibble(.name_repair = "unique")
+  
+  if (run_final_model & (cast_col == "tf_idf")) {
+    
+    print("Creating Test Set Features")
+    # calculating training set IDF scores
+    training_idf_scores <- get_idf_scores(corpus, ngrams, training_matrix)
+    
+    testing_texts <- split_unprocessed_dfs$test$text
+    # testing_texts <- sample_text_ivan
+    testing_corpus <- VCorpus(VectorSource(testing_texts))
+    testing_dtm <- DocumentTermMatrix(testing_corpus, control = list(tokenize = function(x) tokenize_ngrams(x, ngrams = ngrams, cast_col),
+                                                                     weighting = function(x) weightTfIdf(x, normalize = TRUE)))
+    
+    # creating "tm" TF-IDF matrix for back calculation of proper TF-IDF matrix using training IDF scores
+    testing_matrix <- as.matrix(testing_dtm) %>%
+      as_tibble(.name_repair = "unique") %>% 
+      select(all_of(names(training_idf_scores)))
+    
+    # creating test set TF-IDF matrix
+    testing_matrix <- get_proper_testing_tf_idf_scores(testing_corpus, ngrams, testing_matrix, training_idf_scores)
+  }
+  
+  non_sparse_columns <- training_matrix %>%
+    imap_chr(~ifelse(mean(.x == 0) >= sparsity, "exclude", .y)) %>%
+    unique() %>%
+    setdiff("exclude")
+  
+  training_text_mat_final <- training_matrix %>%
+    select(all_of(non_sparse_columns)) %>%
+    replace(is.na(.), 0) %>%
+    mutate(uniq_id = split_unprocessed_dfs$train$uniq_id) %>%
+    select(uniq_id, everything())
+  
+  if (run_final_model) {
+    
+    #not sure what this is doing
+    # testing_non_sparse_columns <- testing_matrix %>%
+    #   imap_chr(~ifelse(mean(.x == 0) >= sparsity, "exclude", .y)) %>%
+    #   unique() %>%
+    #   setdiff("exclude")
+    # probably don't need this, can use non_sparse_columns above bc features should be the same
+    
+    testing_text_mat_final <- testing_matrix %>%
+      select(all_of(non_sparse_columns)) %>%
+      replace(is.na(.), 0) %>%
+      mutate(uniq_id = split_unprocessed_dfs$test$uniq_id) %>%
+      select(uniq_id, everything())
+    
+    return(list("training_text_mat_final" = training_text_mat_final,
+                "testing_text_mat_final" = testing_text_mat_final))
+  } else {
+    
+    return(list("training_text_mat_final" = training_text_mat_final))
+  }
+}
+
+get_idf_scores <- function(corpus, ngrams, tf_idf_matrix) {
+  
+  # create term frequency DTM to back calculate IDF
+  count_dtm <- DocumentTermMatrix(corpus, control = list(tokenize = function(x) tokenize_ngrams(x, ngrams = ngrams, "count")))
+  
+  # create term frequency matrix and select non-sparse columns
+  count_matrix <- as.matrix(count_dtm) %>%
+    as_tibble(.name_repair = "unique") %>% 
+    select(all_of(names(tf_idf_matrix)))
+  
+  # # calculate term count in IDF calculation
+  # global_term_counts <- count_matrix %>% 
+  #   summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
+  # 
+  # # calculate terms in a sentence
+  # document_term_counts <- count_matrix %>% 
+  #   mutate(document_total_terms = rowSums(.))
+  
+  # calculate document frequency in IDF calculation
+  idf_document_frequency <- count_matrix %>% 
+    mutate_if(is.numeric, as.logical) %>%
+    mutate_if(is.logical, as.numeric) %>% 
+    summarise(across(where(is.numeric), ~ sum(.x, na.rm = TRUE)))
+  
+  # calculate IDF for every column using log base 2
+  idf_scores <- log2(nrow(tf_idf_matrix)/idf_document_frequency) %>% 
+    as_tibble()
+  
+  return(idf_scores)
+}
+
+get_proper_testing_tf_idf_scores <- function(testing_corpus, ngrams, testing_matrix, training_idf_scores) {
+  
+  # get test set IDF scores
+  testing_idf_scores <- get_idf_scores(testing_corpus, ngrams, testing_matrix)
+  
+  map_names <- names(testing_matrix)
+  proper_testing_tf_idf_matrix <- map_dfr(map_names,
+                                          function(col_name_) {
+                                            
+                                            # pull correct data
+                                            testing_tf_idf_column <- testing_matrix %>% 
+                                              select(col_name_) %>% 
+                                              pull()
+                                            
+                                            testing_idf_score_column <- testing_idf_scores %>% 
+                                              select(col_name_) %>% 
+                                              pull()
+                                            
+                                            training_idf_score_column <- training_idf_scores %>% 
+                                              select(col_name_) %>% 
+                                              pull()
+                                            
+                                            # back calculate term frequency for test set
+                                            testing_term_frequency_column <- testing_tf_idf_column / testing_idf_score_column
+                                            
+                                            # calculate TF-IDF for test set using test set term frequency and training IDF
+                                            testing_tf_idf_column <- testing_term_frequency_column * training_idf_score_column
+                                            
+                                            return(tibble("column_name" = col_name_,
+                                                          "tf_idf_scores" = testing_tf_idf_column))
+                                          }) %>% 
+    group_by(column_name) %>% 
+    mutate(uniq_id = row_number()) %>% 
+    pivot_wider(names_from = column_name,
+                values_from = tf_idf_scores) %>% 
+    select(-uniq_id)
+  
+  return(proper_testing_tf_idf_matrix)
+}
+
+tokenize_ngrams <- function(x, ngrams, cast_col) {
+  out <- map(ngrams,
+             ~textcnt(as.character(x),
+                      method = "string",
+                      n = .x,
+                      split = "[[:space:][:digit:]]+") %>%
+               unclass() %>%
+               as_tibble(rownames = "ngram") %>% 
+               mutate(duplicated = map2_chr(ngram,
+                                            value,
+                                            ~paste(rep(.x, .y), collapse = "%%%"))) %>% 
+               pull(duplicated) %>% 
+               paste(collapse = "%%%") %>% 
+               str_split("%%%")) %>% 
+    unlist() 
+  
+  if ((cast_col == "bi" | cast_col == "bi_idf")) {
+    return(unique(out))
+  } else {
+    return(out)
+  }
+}
+
+make_model_df <- function(full_data,
+                          predictor_vars) {
+  
+  train_df <- full_data %>% 
+    select(all_of(predictor_vars))
+  
+  return(train_df)
+  
+}
+
+split_data <- function(full_data,
+                       train_prop = 0.6) {
+  
+  unlabeled_df <- full_data %>% 
+    filter(is.na(outcome))
+  
+  train_df <- full_data %>% 
+    setdiff(unlabeled_df) %>% 
+    slice(sample(1:n())) %>% 
+    sample_frac(train_prop)
+  
+  test_df <- full_data %>% 
+    setdiff(unlabeled_df) %>% 
+    setdiff(train_df)
+  
+  out <- list(train = train_df,
+              test = test_df,
+              unlabeled = unlabeled_df)
+  
+  return(out)
+  
+}
+
+fit_lasso <- function(model_df, lambda_ = 0.001) {
+  
+  outcome <- model_df %>% 
+    pull(outcome)
+  
+  predictors <- model_df %>% 
+    select(-outcome) %>% 
+    as.matrix()
+  
+  lasso_fit <- glmnet(predictors, outcome, family = "binomial", 
+                      alpha = 1, lambda = lambda_)
+  
+  return(lasso_fit)
+  
+}
+
+predict_lasso <- function(lasso_fit, new_data) {
+  
+  predictors <- new_data %>% 
+    select(-outcome) %>% 
+    as.matrix()
+  
+  probabilities <- lasso_fit %>% 
+    predict(newx = predictors, type = "response")
+  
+  results <- tibble(true = new_data$outcome, 
+                    predicted = probabilities[,1])
+  
+  return(results)
+  
+}
+
+set_single_threshold <- function(results_df, threshold) {
+  
+  results_df %>% 
+    mutate(predicted_label = as.numeric(predicted > threshold)) 
+  
+}
+
+set_double_threshold <- function(results_df, threshold1, threshold2,
+                                 undetermined_label = -999) {
+  
+  results_df %>% 
+    mutate(predicted_label = case_when(predicted < threshold1  & predicted < threshold2 ~ 0,
+                                       predicted > threshold2 & predicted > threshold1 ~ 1,
+                                       predicted <= threshold2 & predicted >= threshold1 ~ undetermined_label)) 
+  
+}
+
+evaluate_single_classifier <- function(results_df) {
+  
+  pred_funs <- list(sens = sensitivity,
+                    spec = specificity,
+                    ppv = posPredValue,
+                    npv = negPredValue,
+                    n_fn = function(pred, true) sum(true == 1 & pred == 0),
+                    n_fp = function(pred, true) sum(true == 0 & pred == 1),
+                    n = function(pred, true) length(true))
+  
+  out <- map(pred_funs, 
+             ~.x(factor(as.character(results_df$predicted_label), levels = c("1", "0")), 
+                 factor(as.character(as.numeric(results_df$true)), levels = c("1", "0")))) %>% 
+    bind_cols()
+  
+  return(out)
+  
+}
+
+evaluate_double_classifier <- function(results_df,
+                                       undetermined_label = -999) {
+  
+  determined_df <- results_df %>% 
+    filter(predicted_label != undetermined_label)
+  
+  undetermined_df <- results_df %>% 
+    setdiff(determined_df)
+  
+  determined_results <- evaluate_single_classifier(determined_df)
+  
+  nP <- sum(results_df$true == 1)
+  nN <- sum(results_df$true == 0)
+  nUP <- sum(results_df$true == 1 & results_df$predicted_label == undetermined_label)
+  nUN <- sum(results_df$true == 0 & results_df$predicted_label == undetermined_label)
+  nU <- nUP + nUN
+  
+  undetermined_results <- tibble(undetermined_rate = mean(results_df$predicted_label == undetermined_label),
+                                 case_loss = nUP / nP,
+                                 control_loss = nUN / nN,
+  )
+  
+  return(bind_cols(determined_results, undetermined_results))
+  
+}
+
+make_k_folds <- function(data_df, folds = 10) {
+  
+  data_df %>% 
+    mutate(fold = sample(1:folds, n(), replace = T))
+  
+}
+
+do_modeling_within_fold <- function(train_model_df, fold_, lambda) {
+  print(glue::glue("Running fold {fold_}"))
+  train_df <- train_model_df %>% 
+    filter(fold != fold_) %>% 
+    select(-fold)
+  
+  validate_df <- train_model_df %>% 
+    filter(fold == fold_) %>% 
+    select(-fold)
+  
+  lasso_fit <- fit_lasso(train_df, lambda_ = lambda)
+  lasso_predict <- predict_lasso(lasso_fit, validate_df) %>% 
+    mutate(fold = fold_)
+  
+  out <- list(model_fit = lasso_fit,
+              model_output = lasso_predict)
+  
+  return(out)
+  
+}
+
+test_single_thresholds <- function(predictions_df,
+                                   thresholds) {
+  
+  map_dfr(thresholds,
+          ~predictions_df %>% 
+            set_single_threshold(threshold = .x) %>% 
+            evaluate_single_classifier() %>% 
+            mutate(threshold = .x))
+  
+}
+
+test_double_thresholds <- function(predictions_df,
+                                   lower_thresholds,
+                                   upper_thresholds) {
+  
+  map2_dfr(lower_thresholds,
+           upper_thresholds,
+           ~predictions_df %>% 
+             set_double_threshold(threshold1 = .x,
+                                  threshold2 = .y) %>% 
+             evaluate_double_classifier() %>% 
+             mutate(threshold1 = .x,
+                    threshold2 = .y))
+  
+}
+
+make_auc_plot <- function(prediction_df) {
+  
+  auc <- pROC::auc(prediction_df$true * 1,
+                   prediction_df$predicted)
+  auc_plot <- pROC::roc(prediction_df$true * 1,
+                        prediction_df$predicted) %>% 
+    pROC::ggroc() +
+    ggtitle(paste0("AUC = ", as.numeric(round(auc, 4)))) +
+    bbplot::bbc_style() +
+    theme_bw() +
+    theme(axis.title = element_text(size = 20),
+          axis.text = element_text(size = 10),
+          legend.title = element_blank())
+  
+  return(list(auc = auc,
+              auc_plot = auc_plot))
+  
+}
+
+make_auc_plot_double_threshold <- function() {
+  
+  print("Making features")
+  path_dtm <- make_dtm(path_reports, ngrams, cast_col, sparsity = sparsity)
+  dtm_df <- path_dtm
+  full_data <- make_full_dataset(dtm_df, abstracted_data)
+  split_dfs <- split_data(full_data, train_prop = training_prop)
+  
+  predictor_vars <- setdiff(names(dtm_df), names(abstracted_data)) %>% 
+    setdiff(names(path_reports)) %>% 
+    c("outcome", "fold", names(full_data)[grepl("^predictor_", names(full_data))])
+  
+}
+
+get_lasso_features <- function(lasso_fit) {
+  
+  coef(lasso_fit) %>%
+    as.matrix() %>%
+    as_tibble(rownames = "var") %>%
+    filter(abs(s0) > 0) %>% 
+    filter(var != "(Intercept)") %>% 
+    rename(coef = s0) %>% 
+    arrange(desc(abs(coef)))
+  
+}
+
+get_model_predicted_obs <- function(predictions_df,
+                                    min_cost_threshold,
+                                    abstracted_data,
+                                    original_cols_to_join) {
+  #' Gets specific fps, fns, tps, tns from model predictions
+  #' given a df of predicted probabilities, true labels, and 
+  #' a probability threshold (min_cost_threshold)
+  
+  list(fps = predictions_df %>%
+         filter(true == 0,
+                predicted > min_cost_threshold),
+       fns = predictions_df %>%
+         filter(true == 1,
+                predicted < min_cost_threshold),
+       tps = predictions_df %>%
+         filter(true == 1,
+                predicted > min_cost_threshold),
+       tns = predictions_df %>%
+         filter(true == 0,
+                predicted < min_cost_threshold)) %>% 
+    map(~.x %>% 
+          select(uniq_id,
+                 true,
+                 predicted) %>% 
+          left_join(abstracted_data %>% 
+                      select(uniq_id, all_of(original_cols_to_join))))
+  
+}
+
+get_model_predicted_obs_double_threshold <- function(predictions_df,
+                                                     min_cost_threshold,
+                                                     abstracted_data,
+                                                     original_cols_to_join) {
+  
+  list(fps = predictions_df %>%
+         filter(true == 0, 
+                predicted > min_cost_threshold$threshold2),
+       fns = predictions_df %>%
+         filter(true == 1, 
+                predicted < min_cost_threshold$threshold1),
+       tps = predictions_df %>%
+         filter(true == 1, 
+                predicted > min_cost_threshold$threshold2),
+       tns = predictions_df %>%
+         filter(true == 0, 
+                predicted < min_cost_threshold$threshold1)) %>% 
+    map(~.x %>% 
+          select(uniq_id,
+                 true,
+                 predicted) %>% 
+          left_join(abstracted_data %>% 
+                      select(uniq_id, all_of(original_cols_to_join))))
+  
+}
+
+make_calibration_plot <- function(pred_results) {
+  
+  pred_results %>% 
+    mutate(predicted_bin = cut(predicted, breaks = seq(round(min(predicted), 2) 
+                                                       - 0.1, round(max(predicted), 2) + 0.1, 0.1))) %>% 
+    group_by(predicted_bin) %>% 
+    summarise(n_obs = n(),
+              predicted_mean = mean(predicted),
+              real_mean = mean(true)) %>% 
+    pivot_longer(cols = 3:ncol(.),
+                 names_to = "variable",
+                 values_to = "value") %>% 
+    ggplot(aes(x = predicted_bin, fill = variable, y = value)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = n_obs), y = 1.01) +
+    ylim(c(0, 1.1))
+  
+}
+
+get_model_predicted_obs <- function(predictions_df,
+                                    min_cost_threshold,
+                                    abstracted_data,
+                                    original_cols_to_join) {
+  #' Gets specific fps, fns, tps, tns from model predictions
+  #' given a df of predicted probabilities, true labels, and 
+  #' a probability threshold (min_cost_threshold)
+  
+  list(fps = predictions_df %>%
+         filter(true == 0,
+                predicted > min_cost_threshold),
+       fns = predictions_df %>%
+         filter(true == 1,
+                predicted < min_cost_threshold),
+       tps = predictions_df %>%
+         filter(true == 1,
+                predicted > min_cost_threshold),
+       tns = predictions_df %>%
+         filter(true == 0,
+                predicted < min_cost_threshold)) %>% 
+    map(~.x %>% 
+          select(uniq_id,
+                 true,
+                 predicted) %>% 
+          left_join(abstracted_data %>% 
+                      select(uniq_id, all_of(original_cols_to_join))))
+  
+}
+
+get_model_predicted_obs_double_threshold <- function(predictions_df,
+                                                     min_cost_threshold,
+                                                     abstracted_data,
+                                                     original_cols_to_join) {
+  
+  list(fps = predictions_df %>%
+         filter(true == 0, 
+                predicted > min_cost_threshold$threshold2),
+       fns = predictions_df %>%
+         filter(true == 1, 
+                predicted < min_cost_threshold$threshold1),
+       tps = predictions_df %>%
+         filter(true == 1, 
+                predicted > min_cost_threshold$threshold2),
+       tns = predictions_df %>%
+         filter(true == 0, 
+                predicted < min_cost_threshold$threshold1)) %>% 
+    map(~.x %>% 
+          select(uniq_id,
+                 true,
+                 predicted) %>% 
+          left_join(abstracted_data %>% 
+                      select(uniq_id, all_of(original_cols_to_join))))
+  
+}
+
+make_calibration_plot <- function(pred_results) {
+  
+  pred_results %>% 
+    mutate(predicted_bin = cut(predicted, breaks = seq(round(min(predicted), 2) 
+                                                       - 0.1, round(max(predicted), 2) + 0.1, 0.1))) %>% 
+    group_by(predicted_bin) %>% 
+    summarise(n_obs = n(),
+              predicted_mean = mean(predicted),
+              real_mean = mean(true)) %>% 
+    pivot_longer(cols = 3:ncol(.),
+                 names_to = "variable",
+                 values_to = "value") %>% 
+    ggplot(aes(x = predicted_bin, fill = variable, y = value)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    geom_text(aes(label = n_obs), y = 1.01) +
+    ylim(c(0, 1.1))
+  
+}
+
+make_classifier_threshold_plot <- function(classifier_results, min_threshold) {
+  single_p1 <- ggplot(classifier_results %>% 
+                        filter(metric != "cost"), aes(x = threshold, color = metric, y = value)) +
+    geom_line(size = 2) + 
+    bbplot::bbc_style() +
+    theme_bw() +
+    theme(axis.title = element_text(size = 20),
+          axis.text = element_text(size = 10),
+          legend.title = element_blank()) +
+    xlab("Probability threshold") +
+    ylab("") +
+    geom_vline(xintercept = min_threshold, linetype = "dashed")
+  
+  single_p2 <- ggplot(classifier_results %>% 
+                        filter(metric == "cost"), aes(x = threshold, color = metric, y = value)) +
+    geom_line(size = 2) + 
+    bbplot::bbc_style() +
+    theme_bw() +
+    theme(axis.title = element_text(size = 20),
+          axis.text = element_text(size = 10),
+          legend.title = element_blank()) +
+    xlab("Probability threshold") +
+    ylab("Cost") +
+    geom_vline(xintercept = min_threshold, linetype = "dashed") +
+    ggplot2::annotate("text", x = min_threshold, y = Inf, 
+                      label = glue::glue("Minimum cost = {round(min(classifier_results$value[classifier_results$metric == 'cost']), 2)}"), 
+                      vjust = 1.1, hjust = 0.5,
+                      size = 6)
+  
+  single_threshold_plot <- single_p1 / single_p2
+  
+  return(single_threshold_plot)
+}
+
+make_classifier_double_threshold_plot <- function(double_threshold_results, min_cost_threshold_double) {
+  double_threshold_plot <- ggplot(double_threshold_results,
+                                  aes(x = threshold1, y = threshold2, fill = cost)) +
+    geom_tile() +
+    bbplot::bbc_style() +
+    theme_bw() +
+    theme(axis.title = element_text(size = 20),
+          axis.text = element_text(size = 10),
+          legend.title = element_blank()) +
+    xlab("Probability threshold 1") +
+    ylab("Probability threshold 2") +
+    geom_vline(xintercept = min_cost_threshold_double$threshold1, color = "white") +
+    geom_hline(yintercept = min_cost_threshold_double$threshold2, color = "white") +
+    geom_point(color = "white",
+               x = min_cost_threshold_double$threshold1,
+               y = min_cost_threshold_double$threshold2,
+               size = 4) +
+    ggplot2::annotate("text", x = min_cost_threshold_double$threshold1, 
+                      y = Inf, 
+                      label = glue::glue("Minimum cost = {round(min(double_threshold_results$cost), 2)}"), 
+                      vjust = 1.1, hjust = -0.2,
+                      size = 6)
+  
+  return(double_threshold_plot)
+}
+
+do_all_analysis <- function(ngrams,
+                            cast_col,
+                            tune_sparsity,
+                            sparsity_vars,
+                            tune_lambda,
+                            lambda_vars,
+                            markdown_title,
+                            sparsity,
+                            fp_cost,
+                            fn_cost,
+                            undetermined_cost,
+                            lambda,
+                            n_folds,
+                            training_prop,
+                            seed,
+                            outcome_description,
+                            output_file,
+                            run_final_model,
+                            original_cols_to_join) {
+  if (F) {
+    print("Setting test run variables")
+    
+    ngrams = 1:3
+    cast_col = "tf_idf"
+    tune_sparsity = F
+    sparsity_vars = seq(0.90, 0.99, 0.0025)
+    tune_lambda = F
+    lambda_vars = seq(.00005, .04, .0005)
+    markdown_title = "GBM diagnosis training and testing results"
+    sparsity = tibble("tf_idf" = 0.9025,
+                      "bi_idf" = NA)
+    fp_cost = 13.5
+    fn_cost = 8
+    undetermined_cost = 1
+    lambda = tibble("tf_idf"  = 0.01705,
+                    "bi_idf" = NA)
+    n_folds = 10
+    training_prop = .6
+    seed = 12345
+    outcome_description = "Confirmed diagnosis of glioblastoma"
+    output_file = glue::glue("/tmp/gbm_results_{Sys.Date()}.html")
+    run_final_model = T
+    # save_cv_model_outputs = list(t_f = F,
+    #                              save_location = glue::glue("saved_docs/udp/gbm/model_validation/model_outputs_"))
+    original_cols_to_join = c("patient_id", "date")
+  }
+  
+  set.seed(seed)
+  sparsity <- sparsity %>% pull(cast_col)
+  lambda <- lambda %>% pull(cast_col)
+  
+  print("Loading data")
+  loaded_data <- load_data(path, abs_data_name)
+  path_reports <- clean_path_reports(loaded_data)
+  abstracted_data <- add_text_to_abstracted(loaded_data, path_reports)
+  
+  print("Splitting Data")
+  split_unprocessed_dfs <- split_data(abstracted_data, train_prop = training_prop)
+  
+  if (tune_sparsity) {
+    print("Tuning Sparsity")
+    sparsity_results <- sparsity_tune(seed, sparsity_vars, abstracted_data, path_reports, 
+                                      split_unprocessed_dfs, ngrams, cast_col, run_final_model, 
+                                      training_prop, n_folds, lambda, fp_cost, fn_cost)
+    
+    sparsity = sparsity_results$sparsity[1]
+  }
+  
+  if (!tune_sparsity) {
+    print("Making features")
+    dtm_df <- make_dtm(split_unprocessed_dfs, ngrams, cast_col, sparsity = sparsity, run_final_model)
+    split_dfs <- make_full_dataset(dtm_df, abstracted_data, run_final_model)
+    
+    predictor_vars <- setdiff(names(dtm_df$training_text_mat_final), names(abstracted_data)) %>% 
+      setdiff(names(abstracted_data)) %>% 
+      c("outcome", "fold")
+    
+    train_df <- split_dfs$train %>% 
+      make_k_folds(folds = n_folds) %>% 
+      arrange(fold)
+    
+    train_model_df <- make_model_df(train_df, predictor_vars)
+    
+    unique_folds <- sort(unique(train_model_df$fold))
+  }
+  
+  if (tune_lambda) {
+    print("Tuning Lambda")
+    lambda_results <- lambda_tune(seed, lambda_vars, unique_folds, train_model_df, 
+                                  train_df, fp_cost, fn_cost, undetermined_cost)
+    
+    lambda = lambda_results$lambda[1]
+  }
+  
+  if (!tune_lambda & !tune_sparsity) {
+    
+    print("Doing cross-validation")
+    all_cv_results <- map(unique_folds,
+                          do_modeling_within_fold, 
+                          train_model_df = train_model_df,
+                          lambda = lambda) %>% 
+      setNames(unique_folds)
+    
+    all_cv_predictions <- all_cv_results %>% 
+      purrr::transpose() %>% 
+      pluck("model_output") %>% 
+      bind_rows() %>% 
+      bind_cols(train_df %>% 
+                  select(uniq_id)) %>% 
+      select(uniq_id, everything()) %>% 
+      arrange(desc(predicted))
+    
+    all_cv_features <- all_cv_results %>%
+      purrr::transpose() %>%
+      pluck("model_fit") %>%
+      map(~coef(.x) %>%
+            as.matrix() %>%
+            as_tibble(rownames = "var") %>%
+            filter(s0 > 0)) %>%
+      bind_rows() %>%
+      group_by(var) %>%
+      summarise(n_times_selected = n(),
+                avg_coef = mean(s0)) %>%
+      arrange(desc(n_times_selected))
+    
+    print("Making CV AUC and calibration plots")
+    cv_auc_results <- make_auc_plot(all_cv_predictions)
+    calibration_plot_cv <- make_calibration_plot(all_cv_predictions)
+    
+    print("Building classifiers")
+    single_threshold_results <- test_single_thresholds(all_cv_predictions,
+                                                       seq(0.01, 0.99, 0.01)) %>% 
+      mutate(cost = n_fn * fn_cost + n_fp * fp_cost)
+    
+    min_cost_threshold_single <- single_threshold_results %>% 
+      filter(cost == min(cost)) %>% 
+      pull(threshold) %>% 
+      min()
+    
+    double_thresholds <- expand.grid(threshold1 = seq(0.01, .3, 0.01),
+                                     threshold2 = seq(0.7, 0.99, 0.01))
+    
+    double_threshold_results <- test_double_thresholds(all_cv_predictions,
+                                                       double_thresholds$threshold1,
+                                                       double_thresholds$threshold2) %>% 
+      mutate(cost = n_fn * fn_cost + n_fp * fp_cost + undetermined_rate * (n / (1-undetermined_rate)) * undetermined_cost)
+    
+    min_cost_threshold_double <- double_threshold_results %>% 
+      filter(cost == min(cost)) %>% 
+      select(threshold1, threshold2) %>% 
+      head(1)
+    
+    single_threshold_plot_df <- single_threshold_results %>% 
+      pivot_longer(cols = c(sens, spec, npv, ppv, cost),
+                   names_to = "metric")
+    
+    if (run_final_model) {
+      
+      print("Running Final Model")
+      training_dat <- split_dfs$train %>%
+        make_model_df(predictor_vars %>%
+                        setdiff("fold"))
+      
+      testing_dat <- split_dfs$test %>%
+        make_model_df(predictor_vars %>%
+                        setdiff("fold"))
+      
+      lasso_fit <- fit_lasso(training_dat, lambda_ = lambda)
+      predictions <- predict_lasso(lasso_fit, testing_dat) %>%
+        bind_cols(split_dfs$test %>%
+                    select(uniq_id)) %>%
+        left_join(abstracted_data %>% select(uniq_id, text))
+      
+      write.csv(predictions %>% rename(truth = true), "~/Downloads/apr_predictions_10_17.csv")
+      
+      features <- get_lasso_features(lasso_fit) #print features
+      auc_results <- make_auc_plot(predictions) #print AUC results
+      calibration_plot_final_model <- make_calibration_plot(predictions) #print calibration plot
+      
+      min_cost_threshold_single <- single_threshold_results %>%
+        filter(cost == min(cost)) %>%
+        pull(threshold) %>%
+        min()
+      
+      single_threshold_results_final_model_run <- test_single_thresholds(predictions,
+                                                                         min_cost_threshold_single) %>%
+        mutate(cost = n_fn * fn_cost + n_fp * fp_cost) #print single_threshold_results
+      
+      # single threshold predicted obs
+      # final_model_predicted_obs <- get_model_predicted_obs(predictions, 
+      #                                                      min_cost_threshold_single,
+      #                                                      abstracted_data,
+      #                                                      original_cols_to_join)
+      
+      min_double_threshold_thrs <- double_threshold_results %>% 
+        arrange(cost) %>% 
+        head(1)
+      
+      double_threshold_results_final_model_run <- test_double_thresholds(predictions,
+                                                                         min_double_threshold_thrs$threshold1,
+                                                                         min_double_threshold_thrs$threshold2) %>% 
+        mutate(cost = n_fn * fn_cost + n_fp * fp_cost + undetermined_rate * (n / (1-undetermined_rate)) * undetermined_cost)
+      
+      # double threshold predicted obs
+      final_model_predicted_obs <- get_model_predicted_obs_double_threshold(predictions, min_double_threshold_thrs, 
+                                                                            abstracted_data, original_cols_to_join)
+      
+      test_set_results <- list("Notes" = tribble(~Note, ~Description,
+                                                 "Outcome", outcome_description,
+                                                 "Model", glue::glue("L1-regularized logistic regression (lambda = {lambda})"),
+                                                 "Feature set", glue::glue("{ifelse(cast_col == 'count', 'bag-of-words', 
+                                                                  ifelse(cast_col == 'tf_idf', 'TF-IDF', 'BI-IDF'))} with ngram = {ngrams}"),
+                                                 "Sparsity", glue::glue("{sparsity}"),
+                                                 "N training observations" , nrow(training_dat) %>% as.character(),
+                                                 "N testing observations" , nrow(testing_dat) %>% as.character(),
+                                                 "% cases in training set", scales::percent(mean(all_cv_predictions$true), accuracy = 2),
+                                                 "% cases in test set", scales::percent(mean(predictions$true), accuracy = 2),
+                                                 "N predictions made", nrow(predictions) %>% as.character(),
+                                                 "False positive cost", fp_cost %>% as.character(),
+                                                 "False negative cost", fn_cost %>% as.character(),
+                                                 "Undetermined cost", undetermined_cost %>% as.character()),
+                               "AUC results" = list("Single threshold" = auc_results$auc_plot),
+                               #"Double threshold" = ),
+                               "Calibration results" = list("Single threshold" = calibration_plot_final_model),
+                               "Single threshold results" = list("Results" = single_threshold_results_final_model_run),
+                               "Double threshold results" = list("Results" = double_threshold_results_final_model_run),
+                               "Raw model results" = list("Features selected" = features, 
+                                                          "False positives based on best double threshold" = final_model_predicted_obs$fps,
+                                                          "False negatives based on best double threshold" = final_model_predicted_obs$fns,
+                                                          "True positives based on best double threshold" = final_model_predicted_obs$tps,
+                                                          "True negatives based on best double threshold" = final_model_predicted_obs$tns))
+      
+      
+    }
+    
+    print("Generating plots")
+    
+    single_threshold_plot <- make_classifier_threshold_plot(single_threshold_plot_df, min_cost_threshold_single)
+    
+    double_threshold_plot <- make_classifier_double_threshold_plot(double_threshold_results, 
+                                                                   min_cost_threshold_double)
+    
+    
+    min_double_threshold_thrs <- double_threshold_results %>% 
+      arrange(cost) %>% 
+      head(1)
+    #double threshold predicted obs
+    cv_predicted_obs <- get_model_predicted_obs_double_threshold(all_cv_predictions, min_double_threshold_thrs, 
+                                                                 abstracted_data, original_cols_to_join)
+    
+    # single threshold predicted obs
+    # cv_predicted_obs <- get_model_predicted_obs(all_cv_predictions, 
+    #                                             min_cost_threshold_single,
+    #                                             abstracted_data,
+    #                                             original_cols_to_join)
+    
+    training_percent <- training_prop * 100
+    
+    print("Collating final output")
+    
+    training_set_results <- list("Notes" = tribble(~Note, ~Description,
+                                                   "Outcome", outcome_description,
+                                                   "Model", glue::glue("L1-regularized logistic regression (lambda = {lambda})"),
+                                                   "Feature set", glue::glue("{ifelse(cast_col == 'count', 'bag-of-words', 
+                                                                  ifelse(cast_col == 'tf_idf', 'TF-IDF', 'BI-IDF'))} with ngram = {ngrams}"),
+                                                   "Sparsity", glue::glue("{sparsity}"),
+                                                   "N obs. in training data", glue::glue("{nrow(train_model_df) %>% as.character()} ({training_percent}% of data)"),
+                                                   "% cases in training set", scales::percent(mean(all_cv_predictions$true), accuracy = 2),
+                                                   "CV method", glue::glue("{n_folds}-fold CV"),
+                                                   "False positive cost", fp_cost %>% as.character(),
+                                                   "False negative cost", fn_cost%>% as.character(),
+                                                   "Undetermined cost", undetermined_cost%>% as.character()),
+                                 "AUC results" = list("Single threshold" = cv_auc_results$auc_plot),
+                                 #"Double threshold" = )
+                                 "Calibration results" = list("Single threshold" = calibration_plot_cv),
+                                 "Single threshold results" = list("Optimal threshold plot" = single_threshold_plot,
+                                                                   "All results (sorted by cost)" = single_threshold_results %>% 
+                                                                     arrange(cost)),
+                                 "Double threshold results" = list("Optimal threshold plot" = double_threshold_plot,
+                                                                   "All results (sorted by cost)" = double_threshold_results %>% 
+                                                                     arrange(cost)),
+                                 "Raw CV results" = list("Features selected" = all_cv_features, 
+                                                         "False positives based on best double threshold" = cv_predicted_obs$fps,
+                                                         "False negatives based on best double threshold" = cv_predicted_obs$fns,
+                                                         "True positives based on best double threshold" = cv_predicted_obs$tps,
+                                                         "True negatives based on best double threshold" = cv_predicted_obs$tns))
+    if (run_final_model) {
+      final_output <- list("Training set results" = training_set_results,
+                           "Test set results" = test_set_results)
+      
+    } else {
+      final_output <- training_set_results
+    }
+    
+    render_markdown_output(final_output,
+                           markdown_title = markdown_title,
+                           output_file = output_file,
+                           fig_height = 9)
+    
+  }
+  
+  if(exists("sparsity_results") & !exists("lambda_results")){
+    return(tuned_hyperparameters = list("sparsity_results" = sparsity_results))
+  }
+  if(!exists("sparsity_results") & exists("lambda_results")){
+    return(tuned_hyperparameters = list("lambda_results" = lambda_results))
+  }
+  if(exists("sparsity_results") & exists("lambda_results")){
+    return(tuned_hyperparameters = list("sparsity_results" = sparsity_results,
+                                        "lambda_results" = lambda_results))
+  }
+}
